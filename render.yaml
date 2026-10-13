@@ -1,0 +1,22 @@
+# Configuração de deploy no Render (https://render.com)
+# Cria um Web Service com disco persistente para o banco SQLite.
+services:
+  - type: web
+    name: vira-brasil
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: DB_PATH
+        value: /var/data/votos.db
+      # Chave de criptografia dos dados pessoais — gerada automaticamente e secreta
+      - key: SECRET_KEY
+        generateValue: true
+      # Token para exportar os registros descriptografados (uso administrativo)
+      - key: ADMIN_TOKEN
+        generateValue: true
+    disk:
+      name: dados
+      mountPath: /var/data
+      sizeGB: 1

@@ -1,0 +1,5 @@
+node_modules/
+votos.db
+votos.db-shm
+votos.db-wal
+*.log

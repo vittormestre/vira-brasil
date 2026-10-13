@@ -1,0 +1,17 @@
+{
+  "name": "vira-brasil",
+  "version": "1.0.0",
+  "description": "Placar compartilhado de votos virados - campanha Lula 2026",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.3.0",
+    "express": "^4.21.0"
+  }
+}
