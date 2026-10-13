@@ -1,10 +1,11 @@
 // ──────────────────────────────────────────────────────────
 //  Vira Brasil · Backend do placar de votos virados
-//  Node.js + Express + SQLite · com criptografia AES-256-GCM
+//  Node.js puro (sem dependências nativas) · criptografia AES-256-GCM
+//  Armazenamento em arquivo JSON (dados pessoais criptografados)
 // ──────────────────────────────────────────────────────────
 import express from 'express';
-import Database from 'better-sqlite3';
 import crypto from 'crypto';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 
@@ -12,29 +13,23 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3000;
 
 // ──────────────────────────────────────────────────────────
-//  1) CHAVE DE CRIPTOGRAFIA
-//  A chave vem da variável de ambiente SECRET_KEY (defina no Render).
-//  Deve ser uma string longa e aleatória. Em dev, uma é derivada,
-//  mas em PRODUÇÃO você DEVE definir SECRET_KEY própria.
+//  1) CHAVE DE CRIPTOGRAFIA (via SECRET_KEY no Render)
 // ──────────────────────────────────────────────────────────
 const RAW_KEY = process.env.SECRET_KEY || 'DEV-ONLY-troque-esta-chave-em-producao-por-favor';
 if (!process.env.SECRET_KEY) {
   console.warn('⚠️  SECRET_KEY não definida — usando chave de desenvolvimento. NÃO use assim em produção!');
 }
-// Deriva uma chave de 32 bytes (256 bits) a partir do segredo
 const KEY = crypto.createHash('sha256').update(String(RAW_KEY)).digest();
 
-// Criptografa um texto → retorna "iv:tag:dados" em base64
 function encrypt(texto) {
   if (texto == null || texto === '') return null;
-  const iv = crypto.randomBytes(12); // nonce de 96 bits (padrão GCM)
+  const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', KEY, iv);
   const enc = Buffer.concat([cipher.update(String(texto), 'utf8'), cipher.final()]);
   const tag = cipher.getAuthTag();
   return [iv.toString('base64'), tag.toString('base64'), enc.toString('base64')].join(':');
 }
 
-// Descriptografa "iv:tag:dados" → texto original (uso administrativo)
 function decrypt(blob) {
   if (!blob) return null;
   try {
@@ -46,49 +41,58 @@ function decrypt(blob) {
     decipher.setAuthTag(tag);
     return Buffer.concat([decipher.update(data), decipher.final()]).toString('utf8');
   } catch {
-    return null; // dado adulterado ou chave errada
+    return null;
   }
 }
 
 // ──────────────────────────────────────────────────────────
-//  2) BANCO DE DADOS
+//  2) ARMAZENAMENTO (arquivo JSON) — sem dependências nativas
 // ──────────────────────────────────────────────────────────
-const DB_PATH = process.env.DB_PATH || join(__dirname, 'votos.db');
-const db = new Database(DB_PATH);
-db.pragma('journal_mode = WAL');
+const DB_PATH = process.env.DB_PATH || join(__dirname, 'votos.json');
+let registros = []; // [{ uf, nome_enc, tel_enc, criado }]
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS registros (
-    id       INTEGER PRIMARY KEY AUTOINCREMENT,
-    uf       TEXT NOT NULL,
-    nome_enc TEXT NOT NULL,   -- nome criptografado (AES-256-GCM)
-    tel_enc  TEXT,            -- telefone criptografado
-    criado   TEXT NOT NULL DEFAULT (datetime('now'))
-  );
-  CREATE INDEX IF NOT EXISTS idx_uf ON registros(uf);
-`);
+function carregar() {
+  try {
+    if (fs.existsSync(DB_PATH)) {
+      registros = JSON.parse(fs.readFileSync(DB_PATH, 'utf8')) || [];
+    }
+  } catch (e) {
+    console.error('Falha ao carregar dados:', e.message);
+    registros = [];
+  }
+}
+
+let salvando = false, pendente = false;
+function salvar() {
+  // grava de forma assíncrona e segura (escreve em temp e renomeia)
+  if (salvando) { pendente = true; return; }
+  salvando = true;
+  const tmp = DB_PATH + '.tmp';
+  fs.writeFile(tmp, JSON.stringify(registros), (err) => {
+    if (!err) { try { fs.renameSync(tmp, DB_PATH); } catch (e) {} }
+    salvando = false;
+    if (pendente) { pendente = false; salvar(); }
+  });
+}
+
+carregar();
 
 const UFS = new Set(['AC','AL','AP','AM','BA','CE','DF','ES','GO','MA','MT','MS','MG','PA','PB','PR','PE','PI','RJ','RN','RS','RO','RR','SC','SP','SE','TO']);
-
-const insert = db.prepare('INSERT INTO registros (uf, nome_enc, tel_enc) VALUES (?, ?, ?)');
-const totalStmt = db.prepare('SELECT COUNT(*) AS total FROM registros');
-const porEstadoStmt = db.prepare('SELECT uf, COUNT(*) AS c FROM registros GROUP BY uf ORDER BY c DESC');
 
 // ──────────────────────────────────────────────────────────
 //  3) APP + HEADERS DE SEGURANÇA
 // ──────────────────────────────────────────────────────────
 const app = express();
-app.disable('x-powered-by');          // não revela que é Express
-app.set('trust proxy', 1);            // confia no proxy do Render (para o IP real)
+app.disable('x-powered-by');
+app.set('trust proxy', 1);
 app.use(express.json({ limit: '16kb' }));
 
-// Headers de segurança aplicados a todas as respostas
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('X-Frame-Options', 'DENY');                 // impede embutir o site em iframe (anti-clickjacking)
+  res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('Referrer-Policy', 'no-referrer');
   res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
-  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains'); // força HTTPS
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
   res.setHeader('Content-Security-Policy',
     "default-src 'self'; " +
     "img-src 'self' https://commons.wikimedia.org https://upload.wikimedia.org https://thumb.wikimedia.org data:; " +
@@ -104,7 +108,7 @@ app.use((req, res, next) => {
 app.use(express.static(__dirname));
 
 // ──────────────────────────────────────────────────────────
-//  4) RATE LIMITING (anti-flood)
+//  4) RATE LIMITING + HELPERS
 // ──────────────────────────────────────────────────────────
 const hits = new Map();
 function limitar(ip, max, janelaMs) {
@@ -115,7 +119,6 @@ function limitar(ip, max, janelaMs) {
   hits.set(ip, reg);
   return reg.n <= max;
 }
-// limpeza periódica da memória
 setInterval(() => {
   const agora = Date.now();
   for (const [ip, reg] of hits) if (agora > reg.reset) hits.delete(ip);
@@ -126,26 +129,22 @@ function ipDe(req) {
     || req.socket.remoteAddress || 'local';
 }
 
-// Sanitiza texto: remove caracteres de controle e normaliza
 function limpar(txt, maxLen) {
   return String(txt || '')
-    .replace(/[\u0000-\u001F\u007F]/g, '') // remove caracteres de controle
+    .replace(/[\u0000-\u001F\u007F]/g, '')
     .trim()
     .slice(0, maxLen);
 }
 
 function placarAtual() {
-  const total = totalStmt.get().total;
   const porEstado = {};
-  for (const row of porEstadoStmt.all()) porEstado[row.uf] = row.c;
-  return { total, porEstado };
+  for (const r of registros) porEstado[r.uf] = (porEstado[r.uf] || 0) + 1;
+  return { total: registros.length, porEstado };
 }
 
 // ──────────────────────────────────────────────────────────
 //  5) ROTAS
 // ──────────────────────────────────────────────────────────
-
-// GET /api/placar → números públicos (nunca expõe dados pessoais)
 app.get('/api/placar', (req, res) => {
   if (!limitar(ipDe(req), 120, 60000)) {
     return res.status(429).json({ erro: 'Muitas requisições. Aguarde.' });
@@ -153,7 +152,6 @@ app.get('/api/placar', (req, res) => {
   res.json(placarAtual());
 });
 
-// POST /api/registrar → registra 1 voto (dados pessoais criptografados)
 app.post('/api/registrar', (req, res) => {
   if (!limitar(ipDe(req), 15, 60000)) {
     return res.status(429).json({ erro: 'Muitos registros em pouco tempo. Aguarde um instante.' });
@@ -166,22 +164,25 @@ app.post('/api/registrar', (req, res) => {
   if (!UFS.has(uf)) return res.status(400).json({ erro: 'Estado inválido.' });
   if (nome.length < 3) return res.status(400).json({ erro: 'Nome muito curto.' });
 
-  // CRIPTOGRAFA antes de salvar — o banco nunca guarda nome/telefone em texto puro
-  insert.run(uf, encrypt(nome), tel ? encrypt(tel) : null);
+  registros.push({
+    uf,
+    nome_enc: encrypt(nome),
+    tel_enc: tel ? encrypt(tel) : null,
+    criado: new Date().toISOString()
+  });
+  salvar();
 
   res.json({ ok: true, ...placarAtual() });
 });
 
-// GET /api/export?chave=... → exportação administrativa (descriptografada)
-// Protegida por ADMIN_TOKEN. Use só você, para auditar os registros.
+// Exportação administrativa (descriptografada) — protegida por ADMIN_TOKEN
 app.get('/api/export', (req, res) => {
   const token = process.env.ADMIN_TOKEN;
   if (!token || req.query.chave !== token) {
     return res.status(403).json({ erro: 'Acesso negado.' });
   }
-  const rows = db.prepare('SELECT id, uf, nome_enc, tel_enc, criado FROM registros ORDER BY id').all();
-  const dados = rows.map(r => ({
-    id: r.id,
+  const dados = registros.map((r, i) => ({
+    id: i + 1,
     uf: r.uf,
     nome: decrypt(r.nome_enc),
     tel: decrypt(r.tel_enc),
