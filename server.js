@@ -1,23 +1,19 @@
 // ──────────────────────────────────────────────────────────
 //  Vira Brasil · Backend do placar de votos virados
-//  Node.js puro (sem dependências nativas) · criptografia AES-256-GCM
-//  Armazenamento em arquivo JSON (dados pessoais criptografados)
+//  Node.js + Express + PostgreSQL · criptografia AES-256-GCM
 // ──────────────────────────────────────────────────────────
 import express from 'express';
 import crypto from 'crypto';
-import fs from 'fs';
+import pg from 'pg';
 import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
+import { dirname } from 'path';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3000;
 
-// ──────────────────────────────────────────────────────────
-//  1) CHAVE DE CRIPTOGRAFIA (via SECRET_KEY no Render)
-// ──────────────────────────────────────────────────────────
 const RAW_KEY = process.env.SECRET_KEY || 'DEV-ONLY-troque-esta-chave-em-producao-por-favor';
 if (!process.env.SECRET_KEY) {
-  console.warn('⚠️  SECRET_KEY não definida — usando chave de desenvolvimento. NÃO use assim em produção!');
+  console.warn('SECRET_KEY nao definida - usando chave de desenvolvimento.');
 }
 const KEY = crypto.createHash('sha256').update(String(RAW_KEY)).digest();
 
@@ -45,43 +41,33 @@ function decrypt(blob) {
   }
 }
 
-// ──────────────────────────────────────────────────────────
-//  2) ARMAZENAMENTO (arquivo JSON) — sem dependências nativas
-// ──────────────────────────────────────────────────────────
-const DB_PATH = process.env.DB_PATH || join(__dirname, 'votos.json');
-let registros = []; // [{ uf, nome_enc, tel_enc, criado }]
-
-function carregar() {
-  try {
-    if (fs.existsSync(DB_PATH)) {
-      registros = JSON.parse(fs.readFileSync(DB_PATH, 'utf8')) || [];
-    }
-  } catch (e) {
-    console.error('Falha ao carregar dados:', e.message);
-    registros = [];
-  }
+const { Pool } = pg;
+if (!process.env.DATABASE_URL) {
+  console.warn('DATABASE_URL nao definida - conecte um banco PostgreSQL no Render.');
 }
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL && process.env.DATABASE_URL.includes('localhost')
+    ? false
+    : { rejectUnauthorized: false }
+});
 
-let salvando = false, pendente = false;
-function salvar() {
-  // grava de forma assíncrona e segura (escreve em temp e renomeia)
-  if (salvando) { pendente = true; return; }
-  salvando = true;
-  const tmp = DB_PATH + '.tmp';
-  fs.writeFile(tmp, JSON.stringify(registros), (err) => {
-    if (!err) { try { fs.renameSync(tmp, DB_PATH); } catch (e) {} }
-    salvando = false;
-    if (pendente) { pendente = false; salvar(); }
-  });
+async function initDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS registros (
+      id       SERIAL PRIMARY KEY,
+      uf       TEXT NOT NULL,
+      nome_enc TEXT NOT NULL,
+      tel_enc  TEXT,
+      criado   TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_uf ON registros(uf);
+  `);
+  console.log('Banco pronto.');
 }
-
-carregar();
 
 const UFS = new Set(['AC','AL','AP','AM','BA','CE','DF','ES','GO','MA','MT','MS','MG','PA','PB','PR','PE','PI','RJ','RN','RS','RO','RR','SC','SP','SE','TO']);
 
-// ──────────────────────────────────────────────────────────
-//  3) APP + HEADERS DE SEGURANÇA
-// ──────────────────────────────────────────────────────────
 const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
@@ -107,9 +93,6 @@ app.use((req, res, next) => {
 
 app.use(express.static(__dirname));
 
-// ──────────────────────────────────────────────────────────
-//  4) RATE LIMITING + HELPERS
-// ──────────────────────────────────────────────────────────
 const hits = new Map();
 function limitar(ip, max, janelaMs) {
   const agora = Date.now();
@@ -136,23 +119,27 @@ function limpar(txt, maxLen) {
     .slice(0, maxLen);
 }
 
-function placarAtual() {
+async function placarAtual() {
+  const r = await pool.query('SELECT uf, COUNT(*)::int AS c FROM registros GROUP BY uf');
   const porEstado = {};
-  for (const r of registros) porEstado[r.uf] = (porEstado[r.uf] || 0) + 1;
-  return { total: registros.length, porEstado };
+  let total = 0;
+  for (const row of r.rows) { porEstado[row.uf] = row.c; total += row.c; }
+  return { total, porEstado };
 }
 
-// ──────────────────────────────────────────────────────────
-//  5) ROTAS
-// ──────────────────────────────────────────────────────────
-app.get('/api/placar', (req, res) => {
+app.get('/api/placar', async (req, res) => {
   if (!limitar(ipDe(req), 120, 60000)) {
-    return res.status(429).json({ erro: 'Muitas requisições. Aguarde.' });
+    return res.status(429).json({ erro: 'Muitas requisicoes. Aguarde.' });
   }
-  res.json(placarAtual());
+  try {
+    res.json(await placarAtual());
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ erro: 'Erro ao carregar o placar.' });
+  }
 });
 
-app.post('/api/registrar', (req, res) => {
+app.post('/api/registrar', async (req, res) => {
   if (!limitar(ipDe(req), 15, 60000)) {
     return res.status(429).json({ erro: 'Muitos registros em pouco tempo. Aguarde um instante.' });
   }
@@ -161,36 +148,47 @@ app.post('/api/registrar', (req, res) => {
   const nome = limpar(req.body?.nome, 120);
   const tel = limpar(req.body?.tel, 20);
 
-  if (!UFS.has(uf)) return res.status(400).json({ erro: 'Estado inválido.' });
+  if (!UFS.has(uf)) return res.status(400).json({ erro: 'Estado invalido.' });
   if (nome.length < 3) return res.status(400).json({ erro: 'Nome muito curto.' });
 
-  registros.push({
-    uf,
-    nome_enc: encrypt(nome),
-    tel_enc: tel ? encrypt(tel) : null,
-    criado: new Date().toISOString()
-  });
-  salvar();
-
-  res.json({ ok: true, ...placarAtual() });
+  try {
+    await pool.query(
+      'INSERT INTO registros (uf, nome_enc, tel_enc) VALUES ($1, $2, $3)',
+      [uf, encrypt(nome), tel ? encrypt(tel) : null]
+    );
+    res.json({ ok: true, ...(await placarAtual()) });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ erro: 'Erro ao registrar. Tente novamente.' });
+  }
 });
 
-// Exportação administrativa (descriptografada) — protegida por ADMIN_TOKEN
-app.get('/api/export', (req, res) => {
+app.get('/api/export', async (req, res) => {
   const token = process.env.ADMIN_TOKEN;
   if (!token || req.query.chave !== token) {
     return res.status(403).json({ erro: 'Acesso negado.' });
   }
-  const dados = registros.map((r, i) => ({
-    id: i + 1,
-    uf: r.uf,
-    nome: decrypt(r.nome_enc),
-    tel: decrypt(r.tel_enc),
-    criado: r.criado
-  }));
-  res.json({ total: dados.length, registros: dados });
+  try {
+    const r = await pool.query('SELECT id, uf, nome_enc, tel_enc, criado FROM registros ORDER BY id');
+    const dados = r.rows.map(row => ({
+      id: row.id,
+      uf: row.uf,
+      nome: decrypt(row.nome_enc),
+      tel: decrypt(row.tel_enc),
+      criado: row.criado
+    }));
+    res.json({ total: dados.length, registros: dados });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ erro: 'Erro na exportacao.' });
+  }
 });
 
-app.listen(PORT, () => {
-  console.log(`✅ Vira Brasil rodando em http://localhost:${PORT}`);
-});
+initDB()
+  .then(() => {
+    app.listen(PORT, () => console.log('Vira Brasil rodando na porta ' + PORT));
+  })
+  .catch(err => {
+    console.error('Falha ao iniciar o banco:', err);
+    process.exit(1);
+  });
